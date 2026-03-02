@@ -725,14 +725,8 @@ DeviceInformation Plugin::select_device(const std::vector<DeviceInformation>& me
         last_device = valid_devices.front();
     }
 
-    LOG_DEBUG_TAG("Number of valid_devices:%d", valid_devices.size());
-
     for (const auto& item : utilization_thresholds) {
         LOG_DEBUG_TAG("Device: %s. Utilization threshold: %s", item.first.c_str(), std::to_string(item.second).c_str());
-    }
-
-    if (ptr_select_device == NULL) {
-        LOG_DEBUG_TAG("ptr_select_device == NULL");
     }
 
     while (!ptr_select_device) {
@@ -746,7 +740,6 @@ DeviceInformation Plugin::select_device(const std::vector<DeviceInformation>& me
             bool is_excluded = false;
             // check utilization here.
             ov::DeviceIDParser parsed{device->device_name};
-            LOG_DEBUG_TAG("Inside the While loop");
             if (!utilization_thresholds.empty() && utilization_thresholds.count(parsed.get_device_name())) {
                 std::map<std::string, float> device_utilization;
                 try {

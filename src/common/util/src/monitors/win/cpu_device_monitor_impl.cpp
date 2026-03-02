@@ -26,7 +26,7 @@ std::map<std::string, float> CPUDeviceMonitorImpl::get_utilization() {
     if (hPipe == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("CreateFile() failed. Is XPU service running?");
     }
-    
+
     char buffer[2048];
     DWORD bytesRead;
 

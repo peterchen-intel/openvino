@@ -19,7 +19,6 @@ std::map<std::string, float> XPUDeviceMonitorImpl::get_utilization() {
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("CreateFile() failed. Is XPU service running?");
-        return {};
     }
 
     char buffer[2048];
@@ -27,13 +26,10 @@ std::map<std::string, float> XPUDeviceMonitorImpl::get_utilization() {
 
     if (!ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
         throw std::runtime_error("ReadFile() failed.");
-        return {};
     }
 
     buffer[bytesRead] = '\0';
     CloseHandle(hPipe);
-
-    std::cout << "[XPUDeviceMonitor] XPU Info:" << buffer << std::endl;
 
     // Parse the JSON string
     Json parsed = Json::parse(buffer);
@@ -42,11 +38,9 @@ std::map<std::string, float> XPUDeviceMonitorImpl::get_utilization() {
 
     if (m_device_name.find("GPU") != std::string::npos) {
         utilization_map[m_device_name] = static_cast<float>(parsed[1]);
-        std::cout << "GPU utilization:" << m_device_name << " is: " << utilization_map[m_device_name] << std::endl;
     }
     else if (m_device_name.find("NPU") != std::string::npos) {
         utilization_map[m_device_name] = static_cast<float>(parsed[2]);
-        std::cout << "NPU utilization:" << m_device_name << " is: " << utilization_map[m_device_name] << std::endl;
     }
     return utilization_map;
 }

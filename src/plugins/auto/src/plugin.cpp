@@ -720,7 +720,6 @@ DeviceInformation Plugin::select_device(const std::vector<DeviceInformation>& me
         // after remove higher priority device,but the available devices is null,
         // so select the last device of all available Devices.
         ptr_select_device = &last_device;
-        LOG_DEBUG_TAG("Inside valid_devices.empty()");
     } else {
         // select the higher priority device in case all of device utilization is exceeded the threshold.
         last_device = valid_devices.front();

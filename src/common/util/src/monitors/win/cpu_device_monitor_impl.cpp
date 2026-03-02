@@ -25,7 +25,6 @@ std::map<std::string, float> CPUDeviceMonitorImpl::get_utilization() {
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("CreateFile() failed. Is XPU service running?");
-        return {};
     }
     
     char buffer[2048];
@@ -33,13 +32,10 @@ std::map<std::string, float> CPUDeviceMonitorImpl::get_utilization() {
 
     if (!ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
         throw std::runtime_error("ReadFile() failed.");
-        return {};
     }
 
     buffer[bytesRead] = '\0';
     CloseHandle(hPipe);
-
-    std::cout << "[CPUDeviceMonitor] XPU Info:" << buffer << std::endl;
 
     // Parse the JSON string
     Json parsed = Json::parse(buffer);
@@ -80,8 +76,6 @@ std::map<std::string, float> CPUDeviceMonitorImpl::get_utilization() {
             cpus_utilization[std::to_string(index)] = atom_Utilization.at(index);
         }
     }
-
-    std::cout << "CPU utilization:" << cpus_utilization["CPU"] << std::endl;
 
     return cpus_utilization;
 }

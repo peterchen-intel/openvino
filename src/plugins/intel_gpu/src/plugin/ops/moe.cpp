@@ -8,10 +8,10 @@
 #include <intel_gpu/primitives/swiglu.hpp>
 #include <limits>
 
-#include "intel_gpu/op/moe_3gemm_fused_compressed.hpp"
-#include "intel_gpu/op/moe_compressed.hpp"
-#include "intel_gpu/plugin/common_utils.hpp"
+#include "ov_ops/moe_compressed.hpp"
 #include "intel_gpu/plugin/program_builder.hpp"
+#include "intel_gpu/op/moe_3gemm_fused_compressed.hpp"
+#include "intel_gpu/plugin/common_utils.hpp"
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 #include "intel_gpu/primitives/moe_gemm.hpp"
 #include "intel_gpu/primitives/moe_mask_gen.hpp"
@@ -21,7 +21,6 @@ namespace ov {
 namespace op {
 namespace internal {
 using MOE3GemmFusedCompressed = ov::intel_gpu::op::MOE3GemmFusedCompressed;
-using MOECompressed = ov::intel_gpu::op::MOECompressed;
 }  // namespace internal
 }  // namespace op
 }  // namespace ov
@@ -79,7 +78,7 @@ static void CreateMOE3GemmFusedCompressedOp(ProgramBuilder& p, const std::shared
     ///   22: shared_gate_gate_weight - shared expert gate weight for gating,
     ///                   shape [hidden_size]
     const size_t expected_inputs = config.num_shared_expert > 0 ? 23
-                                 : config.routing_type == op::MOECompressed::RoutingType::SIGMOID_BIAS ? 13
+                                 : config.routing_type == ov::op::internal::MOECompressed::RoutingType::SIGMOID_BIAS ? 13
                                  : 11;
     validate_inputs_count(op, {expected_inputs});
 
@@ -97,11 +96,39 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
         input_infos.push_back(cldnn::input_info(input));
     }
     if (config.expert_type == ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU) {
-        // GEMM3_SWIGLU (Qwen3-style MoE) should be handled by FuseMOE3GemmCompressed
-        // which converts MOECompressed(GEMM3_SWIGLU) → MOE3GemmFusedCompressed executed
-        // by the OCL moe_3gemm_swiglu_opt kernel on all architectures.  If execution
-        // reaches here the transformation pipeline is misconfigured.
-        OPENVINO_THROW("[GPU] MOECompressed(GEMM3_SWIGLU) must be handled by FuseMOE3GemmCompressed before program build");
+        // Create GEMM3_SWIGLU specific primitives
+        //   0: hidden_states - input tensor with hidden representations
+        //   1: routing_weights - [num_experts, ...] normalized weights for selected experts
+        //      (input to final multiplication)
+        //   2: router_topk_output_indices - [..., topk] indices of selected top-k experts
+        //   3: w0_weight - expert weights for first projection,
+        //   shape [num_experts, inter_size, group_num, group_size]
+        //   4: w0_scale - expert scale for first projection for compressed experts,
+        //   shape [num_experts, inter_size, group_num, 1]
+        //   5: w0_zp - expert zp for first projection for compressed experts,
+        //   shape [num_experts, inter_size, group_num, 1]
+        //   6: w1_weight - expert weights for second projection,
+        //   shape [num_experts, inter_size, group_num, group_size]
+        //   7: w1_scale - expert scale for second projection for compressed experts,
+        //   shape [num_experts, inter_size, group_num, 1]
+        //   8: w1_zp - expert zp for second projection for compressed experts,
+        //   shape [num_experts, inter_size, group_num, 1]
+        //   9: w2_weight - expert weights for final projection,
+        //   shape [num_experts, hidden_size, group_num, group_size]
+        //   10: w2_scale - expert scale for final projection for compressed experts,
+        //   shape [num_experts, hidden_size, group_num, 1]
+        //   11: w2_zp - expert zp for final projection for compressed experts,
+        //   shape [num_experts, hidden_size, group_num, 1]
+        // Use moe_3gemm_fused_compressed to replace it.
+
+        // Reaching here means MOECompressed (GEMM3_SWIGLU) survived all transformation passes.
+        // It must be replaced by moe_3gemm_fused_compressed via FuseMOE3GemmCompressed; if the
+        // routing subgraph did not match the expected pattern, the model would otherwise fail later
+        // with the cryptic "Input ... hasn't been found in primitive_ids map" from the program builder.
+        // Surface the real cause explicitly here.
+        OPENVINO_THROW("[GPU] MOECompressed (GEMM3_SWIGLU) reached the GPU backend without being fused: "
+                       "FuseMOE3GemmCompressed transformation did not match the routing subgraph for op '",
+                       op->get_friendly_name(), "'. Please check the routing pattern.");
     } else {
         // Create GEMM2_BIAS_SWIGLU_CLAMP specific primitives
         // input0 : input {#tokens, hidden_size}
@@ -169,26 +196,19 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
         moe_gemm_up.has_bias = true;
         p.add_primitive(*op, moe_gemm_up);
 
-        // gpt-oss swiglu pattern
-        // config.expert_alpha : clamp_max
-        // config.expert_beta : swish_beta which is slightly different from usual swiglu pattern
-        // - Applied clamp
-        // - Added one for up value
-        // - Gate stride is 1 (not splitting to half and half)
-        // - config.expert_alpha : clamp_max
-        // - config.expert_beta : swish_beta
-        // TODO : update for each new pattern
+        // GPT-OSS swiglu: stride-2 interleave (gate=swish, up=clamp+add).
         auto moe_swiglu_prim = cldnn::swiglu(moe_swiglu_name,
                                              input_info(moe_gemm_up_name),
                                              2,  // axis
                                              2,  // glu_stride
                                              ov::op::internal::GLU::GluType::Swish,
-                                             0,                     // gate idx
+                                             config.gate_idx,
                                              -config.expert_alpha,  // clamp_min
                                              config.expert_alpha,   // clamp_max
                                              config.expert_beta,    // swish beta
                                              1.0f,                  // up_add_val
-                                             cldnn::tensor());
+                                             cldnn::tensor(),
+                                             config.scale_factor.value_or(-1.0f));   // activations scaling
         p.add_primitive(*op, moe_swiglu_prim);
         std::vector<cldnn::input_info> moe_gemm_down_inputs = {
             input_info(moe_swiglu_name),

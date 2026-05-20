@@ -3,6 +3,7 @@
 //
 #include "openvino/op/moe.hpp"
 
+#include <intel_gpu/primitives/eltwise.hpp>
 #include <intel_gpu/primitives/moe_gather.hpp>
 #include <intel_gpu/primitives/moe_scatter_reduction.hpp>
 #include <intel_gpu/primitives/swiglu.hpp>

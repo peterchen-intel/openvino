@@ -551,27 +551,6 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         manager.register_pass<ov::pass::MarkDequantization>(
             std::vector<ov::element::Type>{ ov::element::i8, ov::element::u8, ov::element::i4, ov::element::u4 },
             !device_info.supports_immad);
-        const bool disable_moe_opt = GPU_DEBUG_VALUE_OR(config.get_disable_moe_opt(), false);
-        if (!disable_moe_opt) {
-            manager.register_pass<ov::pass::FuseVectorizedMOE2GEMM>();
-            pass_config->set_callback<ov::pass::FuseVectorizedMOE2GEMM>([&](const_node_ptr& root) -> bool {
-                // Currently moe op is only supported by systolic-array architectures
-                auto& engine = m_context->get_engine();
-                const auto& info = engine.get_device_info();
-                return (!info.supports_immad);
-            });
-
-            // FuseVectorizedMOE3GEMM converts the original vectorized MoE graph
-            // (separate MatMul + scatter/gather ops) into MOE(GEMM3_SWIGLU) with
-            // packed INT4 weights.  This structural conversion must run on ALL
-            // architectures so that ConvertMOEToMOECompressed can match the INT4
-            // constants downstream.  Without it the raw FP32 decompression chains
-            // reach propagate_constants and cause OOM on MTL-class iGPU.
-            //
-            // FuseMOE3GemmCompressed converts MOECompressed(GEMM3_SWIGLU) into
-            // MOE3GemmFusedCompressed, executed by the OCL moe_3gemm_swiglu_opt
-            // kernel on all architectures including non-systolic (MTL-class) iGPU.
-            manager.register_pass<ov::pass::FuseVectorizedMOE3GEMM>();
 
         const bool is_pa = [&func]() {
             for (const auto& op : func->get_ops()) {
@@ -585,25 +564,19 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         const bool disable_moe_opt = GPU_DEBUG_VALUE_OR(config.get_disable_moe_opt(), false);
 
-        // MOE: TiledMoeBlock -> GatherMatmuls(compressed) -> MoeOp(compressed) -> MoeOpWithRouting(compressed).
-        // Gated on supports_immad: GatherMatmul backend is systolic-only.
-        if (device_info.supports_immad) {
-            manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
+        // Run the compressed MoE fusion chain on all devices, including non-systolic iGPU.
+        manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
 
-            // f32 listed because this pass runs before ConvertPrecision (line ~588);
-            // f32 activations are lowered to f16 before reaching the f16-only DPAS kernels.
-            manager.register_pass<ov::pass::ConvertGatherMatmulToGatherMatmulCompressed>(
-                std::vector<ov::element::Type>{ov::element::f32, ov::element::f16},
-                std::vector<ov::element::Type>{ov::element::u4, ov::element::i4,
-                                               ov::element::i8, ov::element::u8});
-
-            if (!disable_moe_opt) {
-                // PA models flatten batch into seq.
-                const bool has_batch_dim = !is_pa;
-                manager.register_pass<ov::pass::MoeOpFusion>(has_batch_dim);
-                manager.register_pass<ov::intel_gpu::FuseMOESharedExpert>();
-                manager.register_pass<ov::intel_gpu::FuseMOE3GemmCompressed>();
-            }
+        // This pass runs before ConvertPrecision, so f32 activations are still possible here.
+        manager.register_pass<ov::pass::ConvertGatherMatmulToGatherMatmulCompressed>(
+            std::vector<ov::element::Type>{ov::element::f32, ov::element::f16},
+            std::vector<ov::element::Type>{ov::element::u4, ov::element::i4,
+                                           ov::element::i8, ov::element::u8});
+        if (!disable_moe_opt) {
+            const bool has_batch_dim = !is_pa;
+            manager.register_pass<ov::pass::MoeOpFusion>(has_batch_dim);
+            manager.register_pass<ov::intel_gpu::FuseMOESharedExpert>();
+            manager.register_pass<ov::intel_gpu::FuseMOE3GemmCompressed>();
         }
         manager.register_pass<ov::pass::GatedDeltaNetFusion>();
         manager.register_pass<ov::pass::InitNodeInfo>();

@@ -231,10 +231,10 @@ void ExecutionConfig::apply_model_specific_options(const IRemoteContext* context
         //      (see program.cpp: lo.enable_onednn_for<lstm_seq/gru_seq> path which makes
         //       onednn_impls_optimization_attribute non-empty, triggering engine init).
         //   2. in-order OCL command queue (finalize_impl sets this when use_onednn=true).
-        // On non-systolic hardware (supports_immad=false), use_onednn is otherwise false;
-        // setting it true here is safe because FuseVectorizedFC (systolic FC) is gated
-        // independently on supports_immad, so no systolic ops are introduced.
-        if (ov::is_type<ov::intel_gpu::op::MOE3GemmFusedCompressed>(op)) {
+        // Auto-enable this only on architectures with oneDNN support, consistent with
+        // the LSTM/GRU path above, to avoid initializing oneDNN on unsupported devices.
+        if (ov::is_type<ov::intel_gpu::op::MOE3GemmFusedCompressed>(op) &&
+            info.arch >= cldnn::gpu_arch::xe_lp) {
             m_use_onednn = true;
         }
 

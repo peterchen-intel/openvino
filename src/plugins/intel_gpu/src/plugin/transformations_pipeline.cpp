@@ -572,7 +572,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             std::vector<ov::element::Type>{ov::element::f32, ov::element::f16},
             std::vector<ov::element::Type>{ov::element::u4, ov::element::i4,
                                            ov::element::i8, ov::element::u8});
-        if (!disable_moe_opt) {
+        if (!disable_moe_opt && device_info.arch >= cldnn::gpu_arch::xe_lp) {
             const bool has_batch_dim = !is_pa;
             manager.register_pass<ov::pass::MoeOpFusion>(has_batch_dim);
             manager.register_pass<ov::intel_gpu::FuseMOESharedExpert>();

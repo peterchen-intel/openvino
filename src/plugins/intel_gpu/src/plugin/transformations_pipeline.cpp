@@ -564,10 +564,11 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
 
         const bool disable_moe_opt = GPU_DEBUG_VALUE_OR(config.get_disable_moe_opt(), false);
 
-        // Run the compressed MoE fusion chain on all devices, including non-systolic iGPU.
+        // Run compressed MoE conversion passes on all devices, including non-systolic iGPU.
         manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
 
         // This pass runs before ConvertPrecision, so f32 activations are still possible here.
+        // Later MoE fusion passes are applied only on XeLP+.
         manager.register_pass<ov::pass::ConvertGatherMatmulToGatherMatmulCompressed>(
             std::vector<ov::element::Type>{ov::element::f32, ov::element::f16},
             std::vector<ov::element::Type>{ov::element::u4, ov::element::i4,

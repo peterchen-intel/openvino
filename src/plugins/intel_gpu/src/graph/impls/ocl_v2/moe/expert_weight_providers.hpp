@@ -85,6 +85,21 @@ public:
         return *_cache;
     }
 
+    std::shared_ptr<LRUCache> cache_ptr() const {
+        return _cache;
+    }
+
+    // Read-only view of what an asynchronous loader needs to stream an expert into a slot.
+    const cldnn::MOECompressed::Config& config() const {
+        return _config;
+    }
+    const std::vector<size_t>& weight_bin_offsets() const {
+        return _weight_bin_offsets;
+    }
+    const cldnn::moe_weights* resident() const {
+        return _resident;
+    }
+
     moe_otd::ParallelWeightReader& weight_reader() {
         return _weight_reader;
     }

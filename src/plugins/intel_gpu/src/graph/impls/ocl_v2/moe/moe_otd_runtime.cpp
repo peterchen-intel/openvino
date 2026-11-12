@@ -164,6 +164,52 @@ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
     payload.swap(repacked);
 }
 
+std::vector<ExpertTensorPlan> plan_expert_tensors(const cldnn::MOECompressed::Config& config,
+                                                  const std::vector<size_t>& weight_bin_offsets,
+                                                  size_t weight_file_size,
+                                                  cldnn::moe_weights& wei_mem,
+                                                  uint32_t expert,
+                                                  size_t slot) {
+    constexpr size_t tensor_count = cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count;
+    OPENVINO_ASSERT(weight_bin_offsets.size() == tensor_count, "Unexpected number of MOE weight offsets");
+    const auto num_expert = static_cast<size_t>(config.num_expert);
+    OPENVINO_ASSERT(num_expert > 0, "Invalid expert count");
+
+    const std::array<cldnn::memory_ptr, tensor_count> tensors_by_offset = {
+        {wei_mem.gate_w, wei_mem.up_w, wei_mem.down_w, wei_mem.gate_s, wei_mem.up_s, wei_mem.down_s, wei_mem.gate_z, wei_mem.up_z, wei_mem.down_z}};
+
+    std::vector<ExpertTensorPlan> plans;
+    plans.reserve(tensor_count);
+    for (size_t pos = 0; pos < tensor_count; ++pos) {
+        const auto& mem = tensors_by_offset[pos];
+        if (!mem) {
+            continue;
+        }
+        ExpertTensorPlan plan;
+        plan.offset_pos = pos;
+        plan.dst = mem;
+        plan.per_expert_size = mem->get_layout().bytes_count() / num_expert;
+        if (plan.per_expert_size == 0) {
+            continue;
+        }
+        plan.src_offset = weight_bin_offsets[pos] + static_cast<size_t>(expert) * plan.per_expert_size;
+        plan.dst_offset = slot * plan.per_expert_size;
+        OPENVINO_ASSERT(plan.src_offset <= weight_file_size && plan.per_expert_size <= weight_file_size - plan.src_offset,
+                        "Read range out of the OTD weight file: tensor=",
+                        pos,
+                        ", expert=",
+                        expert,
+                        ", src_offset=",
+                        plan.src_offset,
+                        ", per_expert_size=",
+                        plan.per_expert_size,
+                        ", file_size=",
+                        weight_file_size);
+        plans.push_back(std::move(plan));
+    }
+    return plans;
+}
+
 void fill_weights_memory(cldnn::stream& exec_stream,
                          const cldnn::MOECompressed::Config& config,
                          const std::vector<size_t>& weight_bin_offsets,

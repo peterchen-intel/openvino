@@ -10,8 +10,11 @@
 #include "openvino/runtime/shared_buffer.hpp"
 #include "lru_cache.hpp"
 #include "expert_weight_providers.hpp"
+#include "residency/lookahead_context.hpp"
 // clang-format on
 
+using ov::intel_gpu::ocl::moe::EventHandle;
+using ov::intel_gpu::ocl::moe::ExpertSlot;
 using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
 using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
 using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
@@ -505,9 +508,10 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
 
 class MoE3GemmSwigluMLPGateUp : public KernelGenerator {
 public:
-    MoE3GemmSwigluMLPGateUp(bool disable_shared_experts = false)
-        : KernelGenerator("moe_3gemm_swiglu_mlp", "gate_up"),
-          _disable_shared_experts(disable_shared_experts) {}
+    explicit MoE3GemmSwigluMLPGateUp(bool disable_shared_experts = false, bool lookahead = false)
+        : KernelGenerator("moe_3gemm_swiglu_mlp", lookahead ? "gate_up_les" : "gate_up"),
+          _disable_shared_experts(disable_shared_experts),
+          _lookahead(lookahead) {}
 
 protected:
     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
@@ -516,6 +520,9 @@ protected:
         check_gemv_group_size(params);
         add_common_consts(params, jit);
         jit.make("GATE_UP_ENABLE", 1);
+        if (_lookahead) {
+            jit.make("LES_ENABLE", 1);
+        }
         if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH) {
             jit.make("GATE_ACT_GELU_TANH", 1);
         } else if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_ERF) {
@@ -541,13 +548,15 @@ protected:
 
 private:
     bool _disable_shared_experts;
+    bool _lookahead;
 };
 
 class MoE3GemmSwigluMLPDown : public KernelGenerator {
 public:
-    MoE3GemmSwigluMLPDown(bool disable_shared_experts = false)
-        : KernelGenerator("moe_3gemm_swiglu_mlp", "down"),
-          _disable_shared_experts(disable_shared_experts) {}
+    explicit MoE3GemmSwigluMLPDown(bool disable_shared_experts = false, bool lookahead = false)
+        : KernelGenerator("moe_3gemm_swiglu_mlp", lookahead ? "down_les" : "down"),
+          _disable_shared_experts(disable_shared_experts),
+          _lookahead(lookahead) {}
 
 protected:
     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
@@ -556,6 +565,9 @@ protected:
         check_gemv_group_size(params);
         add_common_consts(params, jit);
         jit.make("DOWN_ENABLE", 1);
+        if (_lookahead) {
+            jit.make("LES_ENABLE", 1);
+        }
         if (!_disable_shared_experts && desc->_config.num_shared_expert > 0 &&
             params.input_layouts.size() > static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_WEIGHT)) {
             jit.make("SHARED_EXPERT_ENABLE", 1);
@@ -576,6 +588,7 @@ protected:
 
 private:
     bool _disable_shared_experts;
+    bool _lookahead;
 };
 
 class MoE3GemmSwigluMLPReduce : public KernelGenerator {
@@ -610,6 +623,43 @@ protected:
 
 private:
     bool _disable_shared_experts;
+};
+
+// Work-group size of the LES proxy kernels (a power of two, see moe_lookahead_proxy.cl).
+constexpr size_t kLookaheadProxyLws = 128;
+// The top-k stage keeps the logits of all experts in local memory.
+constexpr size_t kLookaheadMaxExperts = 4096;
+
+// Lookahead proxy of LES v1: ranks the experts of the next layer from the hidden state of this one (moe_lookahead_proxy.cl).
+class MoeLookaheadProxy : public KernelGenerator {
+public:
+    enum class Kind { FC, TOPK };
+    explicit MoeLookaheadProxy(Kind kind) : KernelGenerator("moe_lookahead_proxy", kind == Kind::FC ? "fc" : "topk"), _kind(kind) {}
+
+protected:
+    [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
+        auto jit = KernelGenerator::get_jit_constants(params);
+        auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+        jit.make("PROXY_FC_ENABLE", _kind == Kind::FC ? 1 : 0);
+        jit.make("PROXY_TOPK_ENABLE", _kind == Kind::TOPK ? 1 : 0);
+        jit.make("NUM_EXPERTS", desc->_config.num_expert);
+        jit.make("HIDDEN_SIZE", desc->_config.hidden_size);
+        jit.make("TOP_K", desc->_config.top_k);
+        jit.make("PROXY_LWS", kLookaheadProxyLws);
+        return jit;
+    }
+
+    [[nodiscard]] Arguments get_arguments_desc(const RuntimeParams& params) const override {
+        Arguments args;
+        return args;
+    }
+
+    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
+        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {}};
+    }
+
+private:
+    Kind _kind;
 };
 
 dnnl::memory convert2dnnl(const memory::ptr& ptr, const std::vector<int64_t>& dim, dnnl::memory::format_tag tag, int64_t offset = 0) {
@@ -674,6 +724,11 @@ public:
     // u3 decode on the moe_3gemm_int3 batched GEMV
     Stage::Ptr int3_gemv_gate_up = make_stage<MoE3GemmInt3Gemv>(MoE3GemmInt3Gemv::Projection::GATE_UP);
     Stage::Ptr int3_gemv_down = make_stage<MoE3GemmInt3Gemv>(MoE3GemmInt3Gemv::Projection::DOWN);
+    // LES v1 (lookahead expert scheduling). Declared after all other stages on purpose: see add_stage() order note.
+    Stage::Ptr les_gate_up = make_stage<MoE3GemmSwigluMLPGateUp>(/*disable_shared_experts=*/false, /*lookahead=*/true);
+    Stage::Ptr les_down = make_stage<MoE3GemmSwigluMLPDown>(/*disable_shared_experts=*/false, /*lookahead=*/true);
+    Stage::Ptr les_proxy_fc = make_stage<MoeLookaheadProxy>(MoeLookaheadProxy::Kind::FC);
+    Stage::Ptr les_proxy_topk = make_stage<MoeLookaheadProxy>(MoeLookaheadProxy::Kind::TOPK);
 
     struct dnnl_weights {
         dnnl::memory weight;
@@ -744,6 +799,17 @@ public:
     // OTD slot ids read by kernels that are still in flight when execute() returns,
     // so the buffer must outlive the per-call scratch_buffers.
     memory::ptr _expert_index_buffer;
+
+    // --- LES v1 (lookahead expert scheduling), decode path only ---
+    // True when the lookahead stages were compiled into this impl (property set, OTD on, plain batched GEMV decode).
+    bool _lookahead_compiled = false;
+    // Shared by all MoE impls of a network. Strong reference: it must outlive every in-flight prefetch.
+    std::shared_ptr<ov::intel_gpu::ocl::moe::lookahead::LookaheadContext> _les_ctx;
+    // Pass A / Pass B expert lists (slot per top-k position, -1 = belongs to the other pass). They are read by kernels
+    // that are still in flight when execute() returns. One buffer each is enough: every step drains the queue
+    // (stream.finish()) before it writes them, so no kernel of an earlier step can still be reading.
+    memory::ptr _les_list_a;
+    memory::ptr _les_list_b;
 
     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
 
@@ -1152,6 +1218,11 @@ public:
             _weight_provider = std::make_shared<ResidentExpertWeightProvider>();
         }
 
+        // LES v1 is compiled in only when it can be used: property on, experts offloaded, plain batched GEMV decode, and a
+        // layer shape the proxy supports. Otherwise the impl is byte-for-byte the OTD impl.
+        _lookahead_compiled = config.get_moe_lookahead_prefetch() && cur_moe->_otd.lru_expert_num > 0 && decode_impl == MoeGemmImpl::batched_gemv &&
+                              cur_moe->_config.num_expert <= kLookaheadMaxExperts && cur_moe->_config.top_k <= cur_moe->_config.num_expert;
+
         // Don't change the order of stages
         add_stage(gather, params);
         add_stage(scatter, params);
@@ -1182,6 +1253,13 @@ public:
         }
         if (needs_grouped_gpu_mask_gen()) {
             add_stage(grouped_gemm_mask_gen, params);
+        }
+        // Appended last so the indices of all other stages are unchanged whether LES is compiled in or not.
+        if (_lookahead_compiled) {
+            add_stage(les_gate_up, params);
+            add_stage(les_down, params);
+            add_stage(les_proxy_fc, params);
+            add_stage(les_proxy_topk, params);
         }
     }
 
@@ -1423,6 +1501,7 @@ public:
             ob << nb;
         }
         ob << batched_gemv_threshold;
+        ob << _lookahead_compiled;
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -1436,6 +1515,7 @@ public:
             ib >> nb;
         }
         ib >> batched_gemv_threshold;
+        ib >> _lookahead_compiled;
         const kernel_impl_params* impl_params = reinterpret_cast<kernel_impl_params*>(ib.getKernelImplParams());
         auto cur_moe = impl_params->typed_desc<moe_3gemm_fused_compressed>();
         init(cur_moe);
@@ -1462,6 +1542,7 @@ public:
         cur_moe->decode_impl = decode_impl;
         cur_moe->int3_gemv_nbs = int3_gemv_nbs;
         cur_moe->batched_gemv_threshold = batched_gemv_threshold;
+        cur_moe->_lookahead_compiled = _lookahead_compiled;
         cur_moe->_activation_type = _activation_type;
         return cur_moe;
     }
@@ -1802,6 +1883,254 @@ public:
             ret = exec_batched_gemv_reduce(ret_event, instance, scratch, token_num);
         }
         return ret;
+    }
+
+
+    // ------------------------------------------------------------------------------------------------------------
+    // LES v1 decode step (token_num == 1, experts offloaded).
+    //
+    // Host-side order of one layer L (the sole host block is the readback in step 3):
+    //   1. router of layer L: enqueued by the graph before this primitive
+    //   2. enqueue the proxy of layer L+1 (predicts its experts from this layer's hidden state)
+    //   3. read back the top-k of layer L  (stream.finish(); also completes the proxy)
+    //   4. submit the loads of the missing experts of layer L (demand: high priority)
+    //   5. submit the predicted experts of layer L+1 (speculative: low priority, bounded quota)
+    //   6. enqueue Pass A: experts of L that are already resident
+    //   7. enqueue Pass B: experts of L whose load is in flight or was just requested. The compute queue waits for
+    //      the DMA events on the device (enqueue_barrier), the host never blocks on them.
+    // Both passes write disjoint ranks of scratch.y and the same mlp_reduce sums them, so the result is bit-identical
+    // to the plain OTD path (the prediction only decides what is loaded early, never what is computed).
+    //
+    // Returns false, with the cache left unchanged, when this step must run on the legacy OTD path.
+    // ------------------------------------------------------------------------------------------------------------
+    bool use_lookahead_path(size_t token_num) const {
+        return _lookahead_compiled && token_num == 1 && _weight_provider->is_offloaded() && _weight_provider->is_bound() && les_gate_up->kernel &&
+               les_down->kernel && les_proxy_fc->kernel && les_proxy_topk->kernel;
+    }
+
+    bool exec_batched_gemv_lookahead(const std::vector<cldnn::event::ptr>& events,
+                                     typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                     scratch_buffers& scratch,
+                                     size_t token_num,
+                                     cldnn::event::ptr& result) {
+        namespace la = ov::intel_gpu::ocl::moe::lookahead;
+        auto& net = instance.get_network();
+        auto& stream = net.get_stream();
+        auto& engine = net.get_engine();
+        const auto cur_moe = instance.get_typed_desc<moe_3gemm_fused_compressed>();
+        const size_t top_k = cur_moe->_config.top_k;
+        const size_t num_experts = cur_moe->_config.num_expert;
+        auto provider = std::static_pointer_cast<OffloadExpertWeightProvider>(_weight_provider);
+        auto& cache = provider->cache();
+
+        // The impl can be cloned for another network (infer request) after it has run: never trust a context of another one.
+        if (!_les_ctx || _les_ctx->network() != &net) {
+            _les_ctx = la::LookaheadContext::acquire(net);
+        }
+        auto& ctx = *_les_ctx;
+        ctx.scheduler().rethrow_if_error();  // a background load failed: surface it on the inference thread
+        la::Layer* layer = ctx.find(&instance);
+        if (layer == nullptr) {
+            layer = &ctx.register_layer(net, instance, provider, instance._weights);
+        }
+        if (layer->index == static_cast<size_t>(-1)) {
+            return false;  // not part of the executed order: nothing sensible to schedule
+        }
+
+        const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
+        _hidden_size = static_cast<int>(cur_moe->_config.hidden_size);
+        _intermediate_size = static_cast<int>(cur_moe->_config.inter_size);
+
+        // ---- 2. proxy of the next layer
+        la::Layer* next = ctx.next_of(&instance);
+        const bool predict = next != nullptr && next->num_experts == layer->num_experts && next->hidden_size == layer->hidden_size &&
+                             next->top_k == layer->top_k && next->num_experts <= kLookaheadMaxExperts;
+        memory::ptr proxy_ids;
+        if (predict) {
+            auto logits = ctx.proxy_logits(engine, num_experts);
+            proxy_ids = ctx.proxy_ids(engine, top_k);
+            const auto& r = next->router;
+            // A missing zero point is never read (zp_mode == 0), any valid buffer does as the placeholder argument.
+            auto hidden = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+            auto fc_event = execute_stage(events,
+                                          instance,
+                                          *les_proxy_fc,
+                                          {hidden, r.weights, r.scales, r.zero_points ? r.zero_points : r.scales},
+                                          {logits},
+                                          {num_experts * kLookaheadProxyLws},
+                                          {kLookaheadProxyLws},
+                                          false,
+                                          {r.wei_mode, r.zp_mode, r.group_size, r.scale_transposed});
+            execute_stage({fc_event}, instance, *les_proxy_topk, {logits}, {proxy_ids}, {kLookaheadProxyLws}, {kLookaheadProxyLws});
+        }
+
+        // ---- 3. the one blocking readback: top-k of this layer. It also completes the proxy enqueued above.
+        stream.finish();
+        std::vector<uint32_t> expert_ids(top_k);
+        scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, top_k * sizeof(uint32_t), true);
+        for (auto e : expert_ids) {
+            OPENVINO_ASSERT(e < num_experts, "MoE LES: router returned expert ", e, " but the layer has ", num_experts, " experts");
+        }
+
+        cache.set_speculation_enabled(true);
+        auto partition = cache.partition_3way(expert_ids);
+        if (!partition) {
+            return false;  // more unique experts than slots: the legacy path falls back to the per-expert loop
+        }
+        std::vector<size_t> pinned;
+        for (const auto* group : {&partition->ready, &partition->inflight, &partition->missing}) {
+            for (const auto& e : *group) {
+                pinned.push_back(e.slot);
+            }
+        }
+
+        try {
+            // This layer is computing now: speculative work for it or for an earlier layer is useless.
+            ctx.scheduler().set_cursor(layer->index);
+
+            // ---- 4. missing experts of this layer
+            la::PrefetchTarget target{provider->cache_ptr(), layer->load_target, layer->index};
+            std::vector<EventHandle> demand_events;
+            if (!partition->missing.empty()) {
+                demand_events = ctx.scheduler().submit_demand(target, partition->missing);
+            }
+
+            // ---- 5. predicted experts of the next layer
+            if (predict) {
+                std::vector<uint32_t> predicted;
+                {
+                    mem_lock<int32_t, mem_lock_type::read> lock(proxy_ids, stream);
+                    for (size_t i = 0; i < top_k && i < lock.size(); ++i) {
+                        if (lock[i] >= 0 && static_cast<size_t>(lock[i]) < next->num_experts) {
+                            predicted.push_back(static_cast<uint32_t>(lock[i]));
+                        }
+                    }
+                }
+                next->provider->cache().set_speculation_enabled(true);
+                ctx.scheduler().submit_speculative(la::PrefetchTarget{next->provider->cache_ptr(), next->load_target, next->index},
+                                                   std::move(predicted),
+                                                   la::LookaheadContext::speculative_quota(next->provider->resident_capacity(), top_k));
+            }
+
+            // ---- 6./7. Pass A (resident) and Pass B (in flight + just requested)
+            if (auto* perf = moe_otd::get_perf_counters()) {
+                perf->gpu_hits.fetch_add(partition->ready.size() + partition->inflight.size(), std::memory_order_relaxed);
+                perf->gpu_misses.fetch_add(partition->missing.size(), std::memory_order_relaxed);
+            }
+            const size_t list_bytes = top_k * sizeof(int32_t);
+            for (auto* list : {&_les_list_a, &_les_list_b}) {
+                if (!*list || (*list)->size() < list_bytes) {
+                    *list = engine.allocate_memory(cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(list_bytes)}, ov::element::i8, cldnn::format::bfyx),
+                                                   allocation_type::usm_host,
+                                                   false);
+                }
+            }
+            std::vector<cldnn::event::ptr> waits;
+            auto add_wait = [&waits](const EventHandle& ev) {
+                if (ev && std::find(waits.begin(), waits.end(), ev) == waits.end()) {
+                    waits.push_back(ev);
+                }
+            };
+            bool has_a = false;
+            bool has_b = false;
+            {
+                mem_lock<int32_t, mem_lock_type::write> la_lock(_les_list_a, stream);
+                mem_lock<int32_t, mem_lock_type::write> lb_lock(_les_list_b, stream);
+                for (size_t k = 0; k < top_k; ++k) {
+                    la_lock[k] = -1;  // LES_SKIP_SENTINEL
+                    lb_lock[k] = -1;
+                    const uint32_t e = expert_ids[k];
+                    auto match = [e](const ExpertSlot& s) {
+                        return s.expert == e;
+                    };
+                    if (auto it = std::find_if(partition->ready.begin(), partition->ready.end(), match); it != partition->ready.end()) {
+                        la_lock[k] = static_cast<int32_t>(it->slot);
+                        has_a = true;
+                    } else if (auto it_f = std::find_if(partition->inflight.begin(), partition->inflight.end(), match); it_f != partition->inflight.end()) {
+                        lb_lock[k] = static_cast<int32_t>(it_f->slot);
+                        add_wait(it_f->ready_event);
+                        has_b = true;
+                    } else {
+                        auto it_m = std::find_if(partition->missing.begin(), partition->missing.end(), match);
+                        OPENVINO_ASSERT(it_m != partition->missing.end(), "MoE LES: expert ", e, " is in none of R/F/M");
+                        lb_lock[k] = static_cast<int32_t>(it_m->slot);
+                        add_wait(demand_events[static_cast<size_t>(it_m - partition->missing.begin())]);
+                        has_b = true;
+                    }
+                }
+            }
+
+            const auto& wei = scratch.moe_fusion_wei_addr;
+            const size_t compute_experts = top_k + (_has_shared_expert ? 1 : 0);
+            auto hidden_states = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+            const auto run_pass = [&](const memory::ptr& list, bool skip_shared, const std::vector<cldnn::event::ptr>& deps, bool completion_event) {
+                std::vector<memory::ptr> args_gate_up = {list, wei.weight[0], wei.scale[0], wei.zp[0], wei.weight[1], wei.scale[1], wei.zp[1]};
+                std::vector<memory::ptr> args_down = {list, wei.weight[2], wei.scale[2], wei.zp[2]};
+                if (_has_shared_expert) {
+                    args_gate_up.insert(args_gate_up.end(),
+                                        {wei.shared_weight[0],
+                                         wei.shared_scale[0],
+                                         wei.shared_zp[0],
+                                         wei.shared_weight[1],
+                                         wei.shared_scale[1],
+                                         wei.shared_zp[1],
+                                         wei.shared_weight[3],
+                                         scratch.routing_weights});
+                    args_down.insert(args_down.end(), {wei.shared_weight[2], wei.shared_scale[2], wei.shared_zp[2]});
+                }
+                args_gate_up.push_back(hidden_states);
+                args_down.push_back(scratch.up);
+                args_down.push_back(scratch.topk_weights);
+                if (_has_shared_expert) {
+                    args_down.push_back(scratch.routing_weights);
+                }
+                const std::vector<int> skip = {skip_shared ? 1 : 0};
+                auto up_event = execute_stage(deps,
+                                              instance,
+                                              *les_gate_up,
+                                              args_gate_up,
+                                              {scratch.up},
+                                              {token_num * compute_experts, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
+                                              {1, subgroup_size, SUBGROUP_NUM},
+                                              false,
+                                              skip);
+                return execute_stage({up_event},
+                                     instance,
+                                     *les_down,
+                                     args_down,
+                                     {scratch.y},
+                                     {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
+                                     {1, subgroup_size, SUBGROUP_NUM},
+                                     completion_event,
+                                     skip);
+            };
+
+            // The shared expert is computed by whichever pass runs first. The kernels of the last pass are the last readers of
+            // the expert slots, so their completion event is the write-after-read fence of every slot of this layer. It has to
+            // be a real event: with barrier synchronisation an event that is not requested is an empty stamp the DMA queue
+            // would silently not wait for.
+            cldnn::event::ptr last;
+            if (has_a) {
+                last = run_pass(_les_list_a, /*skip_shared=*/false, events, /*completion_event=*/!has_b);
+            }
+            if (has_b) {
+                if (!waits.empty()) {
+                    stream.enqueue_barrier(waits);  // device-side wait for the DMA copies, the host does not block
+                }
+                std::vector<cldnn::event::ptr> deps = has_a ? std::vector<cldnn::event::ptr>{last} : events;
+                deps.insert(deps.end(), waits.begin(), waits.end());  // event-based sync modes do not look at the barrier
+                last = run_pass(_les_list_b, /*skip_shared=*/has_a, deps, /*completion_event=*/true);
+            }
+            result = exec_batched_gemv_reduce(last, instance, scratch, token_num);
+            cache.unpin(pinned, last);
+            // Loads on the DMA queue may depend on `last` (write after read): an event of a queue that was never flushed
+            // can leave the other queue waiting for it forever.
+            stream.flush();
+        } catch (...) {
+            cache.unpin(pinned, nullptr);
+            throw;
+        }
+        return true;
     }
 
     // Experts of a batched GEMV path: the topk ids, or their remapped slots once OTD leased them. nullptr if they
@@ -2957,6 +3286,12 @@ public:
         // use optimized GEMV kernels with batch dimension. Avoids gather/scatter overhead.
         const MoeGemmImpl impl = select_impl(token_num);
         if (impl == MoeGemmImpl::batched_gemv) {
+            if (use_lookahead_path(token_num)) {
+                cldnn::event::ptr lookahead_event;
+                if (exec_batched_gemv_lookahead(events, instance, scratch, token_num, lookahead_event)) {
+                    return lookahead_event;
+                }
+            }
             return exec_batched_gemv(events, instance, scratch, token_num);
         }
         if (impl == MoeGemmImpl::int3_batched_gemv) {

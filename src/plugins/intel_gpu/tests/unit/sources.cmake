@@ -221,6 +221,8 @@ set(GPU_UNIT_TESTS_SRCS
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_gather_gpu_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_gemm_gpu_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_mask_gen_gpu_test.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_lookahead_lru_cache_test.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_lookahead_scheduler_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_offload_constant_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_offload_lru_cache_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/test_cases/moe_offload_primitive_test.cpp

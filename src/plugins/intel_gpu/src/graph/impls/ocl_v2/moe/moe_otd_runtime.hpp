@@ -88,6 +88,25 @@ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
                               std::vector<uint8_t>& payload,
                               size_t per_expert_size);
 
+/// One tensor (weight / scale / zero point) of one expert: where it is in the weights file and where it goes in the
+/// device buffer of a slot. offset_pos follows cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count order.
+struct ExpertTensorPlan {
+    size_t offset_pos = 0;
+    cldnn::memory_ptr dst;
+    size_t per_expert_size = 0;
+    size_t src_offset = 0;
+    size_t dst_offset = 0;
+};
+
+/// Plans the load of one expert into one slot without touching the file or the device. Tensors that are absent
+/// (symmetric weights have no zero points) are skipped. Throws if a read range lies outside the weights file.
+std::vector<ExpertTensorPlan> plan_expert_tensors(const cldnn::MOECompressed::Config& config,
+                                                  const std::vector<size_t>& weight_bin_offsets,
+                                                  size_t weight_file_size,
+                                                  cldnn::moe_weights& wei_mem,
+                                                  uint32_t expert,
+                                                  size_t slot);
+
 void fill_weights_memory(cldnn::stream& exec_stream,
                          const cldnn::MOECompressed::Config& config,
                          const std::vector<size_t>& weight_bin_offsets,

@@ -434,7 +434,13 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     __global MOE_DTYPE* shared_gate_out,           // [token_num] — output: sigmoid(dot(x, gate_weight)) for shared expert
 #    endif
     __global MOE_DTYPE* x,    // [token_num, HIDDEN_SIZE]
-    __global MOE_DTYPE* y) {  // [token_num * EXPERTS_PER_TOKEN, INTERMEDIATE_SIZE]
+    __global MOE_DTYPE* y     // [token_num * EXPERTS_PER_TOKEN, INTERMEDIATE_SIZE]
+#    if LES_ENABLE
+    ,
+    const int les_skip_shared) {  // 1: this pass leaves the shared expert to the other pass
+#    else
+    ) {
+#    endif
     // global: [token_num*EXPERTS_PER_TOKEN, SUBGROUP_SIZE, N//N_BLOCK],[1, SUBGROUP_SIZE, SUBGROUP_NUM]
     // Batched GEMV: each workgroup handles one (token, expert) pair.
     // For single token (token_num=1), flat_id == expert_slot and token_idx == 0.
@@ -448,6 +454,14 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     bool is_shared = (expert_slot == MAX_TOPK);
 #    else
     bool is_shared = false;
+#    endif
+
+#    if LES_ENABLE && SHARED_EXPERT_ENABLE
+    // LES split pass: the decision depends on get_global_id(0) only, so it is uniform per work-group (local size 1 in
+    // dimension 0) and every work-item leaves before the first barrier.
+    if (is_shared && les_skip_shared) {
+        return;
+    }
 #    endif
 
 #    if WEIGHT_COMPRESSEION_DT == 0
@@ -472,6 +486,11 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
 
     if (!is_shared) {
         expert_id = expert_list[token_idx * MAX_TOPK + expert_slot];
+#    if LES_ENABLE
+        if (expert_id < 0) {  // slot belongs to the other pass (LES_SKIP_SENTINEL)
+            return;
+        }
+#    endif
         // gate, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
         gate_weight = (__global MOE_WEI_DT*)(gate_weight_addr + expert_id * expert_wei_size);
         gate_scale = (__global MOE_SCALE_DT*)(gate_scale_addr + expert_id * expert_scale_size);
@@ -961,7 +980,13 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
 #    if SHARED_EXPERT_ENABLE
                                                                            const __global MOE_DTYPE* shared_gate_in,   // [token_num] separate shared expert gate values
 #    endif
-                                                                           __global MOE_DTYPE* y) {              // [token_num * EXPERTS_PER_TOKEN, HIDDEN_SIZE]
+                                                                           __global MOE_DTYPE* y             // [token_num * EXPERTS_PER_TOKEN, HIDDEN_SIZE]
+#    if LES_ENABLE
+                                                                           ,
+                                                                           const int les_skip_shared) {
+#    else
+                                                                           ) {
+#    endif
     // global: [token_num*EXPERTS_PER_TOKEN, SUBGROUP_SIZE, N//N_BLOCK],[1, SUBGROUP_SIZE, SUBGROUP_NUM]
     int flat_id = get_global_id(0);
     int token_idx = flat_id / EXPERTS_PER_TOKEN;
@@ -973,6 +998,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
     bool is_shared = (expert_slot == MAX_TOPK);
 #    else
     bool is_shared = false;
+#    endif
+
+#    if LES_ENABLE && SHARED_EXPERT_ENABLE
+    if (is_shared && les_skip_shared) {
+        return;
+    }
 #    endif
 
 #    if WEIGHT_COMPRESSEION_DT == 0
@@ -993,6 +1024,11 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
 
     if (!is_shared) {
         expert_id = expert_list[token_idx * MAX_TOPK + expert_slot];
+#    if LES_ENABLE
+        if (expert_id < 0) {
+            return;
+        }
+#    endif
         // down, [INTERMEDIATE_SIZE, HIDDEN_SIZE]
         weight = (__global MOE_WEI_DT*)(down_weight_addr + expert_id * expert_wei_size);
         scales = (__global MOE_SCALE_DT*)(down_scale_addr + expert_id * expert_scale_size);

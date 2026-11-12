@@ -58,6 +58,10 @@ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /
 }
 
 std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) {
+    // This path is not aware of asynchronous loads. Stop new speculative loads and let the ones in flight land, so that
+    // nothing writes a slot behind its back (and a slot filled by a speculative load is seen as a hit).
+    _cache->set_speculation_enabled(false);
+    _cache->wait_no_pending();
     // Deduplicate to check capacity
     std::unordered_map<uint32_t, size_t> expert_to_slot;
     expert_to_slot.reserve(experts.size());
@@ -102,6 +106,8 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
 }
 
 size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& stream) {
+    _cache->set_speculation_enabled(false);
+    _cache->wait_no_pending();
     auto* perf = moe_otd::get_perf_counters();
 
     const auto item = _cache->get_lru_item(expert);

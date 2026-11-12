@@ -49,6 +49,12 @@ set(GPU_OCL_V2_IMPL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_mask_gen.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_mask_gen.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_runtime.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/dma_expert_loader.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/dma_expert_loader.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/expert_prefetch_scheduler.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/expert_prefetch_scheduler.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/lookahead_context.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/lookahead_context.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_runtime.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_router_fused_opt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_router_fused_opt.hpp
@@ -141,6 +147,7 @@ set(GPU_OCL_V2_KERNEL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/moe_3gemm_swiglu_fuse.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_3gemm_swiglu_mlp.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_gate_activation.cl
+    ${CMAKE_CURRENT_LIST_DIR}/moe_lookahead_proxy.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_gather_ref.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_gemm.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_mask_gen.cl
